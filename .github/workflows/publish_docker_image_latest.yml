@@ -1,48 +1,99 @@
-name: Build Docker image
+name: Build and push docker images
 
 on:
+  workflow_run:
+    workflows:
+      - Automated Tagging # Triggered after tagging pipeline finishes
+    types:
+      - completed
   push:
     branches:
-      - main
+      - '**' # Run on all branches
+    tags:
+      - '*'  # Run on all tags
+
+env:
+  APPLICATION_NAME: 'evolution-api'
+  ACCOUNT_ECR: '642297081875'
+  REGION_ECR: us-east-1
 
 jobs:
-  build_deploy:
-    name: Build and Deploy
+  setup:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    outputs:
+      TAG: ${{ steps.vars.outputs.tag }}
+      REGISTRY: ${{ steps.login-ecr-me2.outputs.registry }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Check out the repo
+        uses: actions/checkout@v2
         with:
-          images: evoapicloud/evolution-api
-          tags: latest
+          fetch-depth: 0 # Ensure all tags are fetched
+
+      - name: Fetch all tags
+        run: |
+          git fetch --tags --force
+
+      - name: Get the latest tag for the current commit
+        id: vars
+        run: |
+          # Fetch all tags again to ensure they are up-to-date
+          git fetch --tags --force
+          
+          # Get all tags pointing to the current commit and sort them
+          tags=$(git tag --points-at HEAD | sort -V | tail -n 1)
+
+          if [ -z "$tags" ]; then
+            echo "No tag found for the current commit. Defaulting to commit SHA."
+            tags=$(git rev-parse --short HEAD)
+          fi
+          
+          echo "Using tag: $tags"
+          echo "::set-output name=tag::$tags"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr-me2
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - uses: int128/create-ecr-repository-action@v1
+        id: ecr-me2
+        with:
+          repository: ${{ env.APPLICATION_NAME }}
+
+  build_app:
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          platforms: arm64
 
-      - name: Build and push
-        id: docker_build
-        uses: docker/build-push-action@v5
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
         with:
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
 
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+      - name: Login to Amazon ECR
+        id: login-ecr-me2
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push APP docker image to Amazon ECR
+        env:
+          REGISTRY: ${{ needs.setup.outputs.REGISTRY }}
+          REPOSITORY: ${{ env.APPLICATION_NAME }}
+          IMAGE_TAG: ${{ needs.setup.outputs.TAG }}
+        run: |
+          docker build --platform linux/arm64 -t ${{ env.ACCOUNT_ECR }}.dkr.ecr.${{ env.REGION_ECR }}.amazonaws.com/${{ env.APPLICATION_NAME }}:$IMAGE_TAG .
+          docker push ${{ env.ACCOUNT_ECR }}.dkr.ecr.${{ env.REGION_ECR }}.amazonaws.com/${{ env.APPLICATION_NAME }}:$IMAGE_TAG
